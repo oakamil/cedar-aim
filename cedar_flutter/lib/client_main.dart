@@ -493,6 +493,11 @@ class MyHomePageState extends State<MyHomePage> {
   bool _dontShowSolverFailed = false;
   bool _dontShowSetupFinished = false;
 
+  // New state variables for panel collapse/expand
+  bool _isDisplayConstrained = false;
+  bool _isLeftPanelExpanded = true;
+  bool _isRightPanelExpanded = true;
+
   // Whether we should offer a menu item to set the observer location via a map.
   bool _offerMap = false;
 
@@ -1429,7 +1434,7 @@ class MyHomePageState extends State<MyHomePage> {
     final shortDimension = portrait ? constraints.width : constraints.height;
 
     final calculations = _getLayoutCalculations(containerSize);
-    final panelWidth = calculations['panelWidth']!;
+    final panelWidth = calculations['dataPanelWidth']!;
 
     // Note that widgets are sized according to two factors. The first is
     // `textScale`, which is the user-chosen text size (small/medium/large). The
@@ -1796,6 +1801,7 @@ class MyHomePageState extends State<MyHomePage> {
 
     // Calculate layout dimensions
     const minPanelWidth = 120.0;
+    const collapsedPanelWidth = 30.0;
     final longDimension = portrait ? constraints.height : constraints.width;
     final shortDimension = portrait ? constraints.width : constraints.height;
     const spacingWidth = 0.0;
@@ -1809,14 +1815,17 @@ class MyHomePageState extends State<MyHomePage> {
         naturalImageSize + 2 * minPanelWidth + spacingWidth;
 
     final double actualImageSize;
-    final double panelWidth;
+    final double dataPanelWidth;
+    final double controlPanelWidth;
 
     if (longDimension >= naturalLayoutWidth) {
       // We have plenty of space - use natural image size and let panels expand
       actualImageSize = naturalImageSize;
       // Calculate how much extra space we have and distribute it to panels
       final extraSpace = longDimension - naturalLayoutWidth;
-      panelWidth = minPanelWidth + (extraSpace / 2);
+      dataPanelWidth = minPanelWidth + (extraSpace / 2);
+      controlPanelWidth = dataPanelWidth;
+      _isDisplayConstrained = false;
     } else {
       // Space is constrained - calculate based on available space
       final remainingWidth = longDimension - naturalImageSize - spacingWidth;
@@ -1824,12 +1833,24 @@ class MyHomePageState extends State<MyHomePage> {
       if (remainingWidth >= minPanelsWidth) {
         // We can fit minimum panels with natural image size
         actualImageSize = naturalImageSize;
-        panelWidth = remainingWidth / 2;
+        dataPanelWidth = remainingWidth / 2;
+        controlPanelWidth = dataPanelWidth;
+        _isDisplayConstrained = false;
       } else {
-        // Must shrink image to fit minimum panels
-        actualImageSize =
-            math.max(50.0, longDimension - minPanelsWidth - spacingWidth);
-        panelWidth = minPanelWidth;
+        final leftPanelWidth = _isLeftPanelExpanded ? minPanelWidth : collapsedPanelWidth;
+        final rightPanelWidth = _isRightPanelExpanded ? minPanelWidth : collapsedPanelWidth;
+        final actualPanelsWidth = leftPanelWidth + rightPanelWidth;
+        if (remainingWidth >= actualPanelsWidth) {
+          // We can fit collapsed panel(s) with natural image size
+          actualImageSize = naturalImageSize;
+        } else {
+          // Must shrink image to fit panels
+          actualImageSize =
+                math.max(50.0, longDimension - actualPanelsWidth - spacingWidth);
+        }
+        dataPanelWidth = portrait || _rightHanded ? leftPanelWidth : rightPanelWidth;
+        controlPanelWidth = portrait || _rightHanded ? rightPanelWidth : leftPanelWidth;
+        _isDisplayConstrained = true;
       }
     }
 
@@ -1837,13 +1858,85 @@ class MyHomePageState extends State<MyHomePage> {
 
     return {
       'actualImageSize': actualImageSize,
-      'panelWidth': panelWidth,
+      'dataPanelWidth': dataPanelWidth,
+      'controlPanelWidth': controlPanelWidth,
       'displayScale': displayScale,
     };
   }
 
   double _getDisplayScale([Size? containerSize]) {
     return _getLayoutCalculations(containerSize)['displayScale']!;
+  }
+
+  void _toggleLeftPanel() {
+    setState(() {
+      _isLeftPanelExpanded = !_isLeftPanelExpanded;
+    });
+  }
+
+  void _toggleRightPanel() {
+    setState(() {
+      _isRightPanelExpanded = !_isRightPanelExpanded;
+    });
+  }
+
+  Widget _buildSidePanel({
+    required bool isLeft,
+    required bool isExpanded,
+    required VoidCallback onToggle,
+    required Widget content,
+    required double panelWidth,
+  }) {
+    if (!_isDisplayConstrained) {
+      return SizedBox(
+        width: panelWidth,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 5),
+          child: Center(
+            child: content,
+          ),
+        ),
+      );
+    }
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+      child: SizedBox(
+        width: panelWidth,
+        child: Stack(
+          children: [
+            if (isExpanded)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5),
+                child: Center(child: content),
+              ),
+            if (!isExpanded)
+              Center(
+                child: IconButton(
+                  icon: Icon(
+                    isLeft ? Icons.chevron_right : Icons.chevron_left,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                  onPressed: onToggle,
+                  tooltip: 'Expand Panel',
+                ),
+              )
+            else
+              Align(
+                alignment: isLeft ? Alignment.centerRight : Alignment.centerLeft,
+                child: IconButton(
+                  icon: Icon(
+                    isLeft ? Icons.chevron_left : Icons.chevron_right,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                  onPressed: onToggle,
+                  tooltip: 'Collapse Panel',
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _orientationLayout(BuildContext context, [Size? containerSize]) {
@@ -1898,7 +1991,8 @@ class MyHomePageState extends State<MyHomePage> {
               // Get layout calculations
               final calculations = _getLayoutCalculations(containerSize);
               final actualImageSize = calculations['actualImageSize']!;
-              final panelWidth = calculations['panelWidth']!;
+              final dataPanelWidth = calculations['dataPanelWidth']!;
+              final controlPanelWidth = calculations['controlPanelWidth']!;
 
               return Center(
                 child: Row(
@@ -1906,30 +2000,28 @@ class MyHomePageState extends State<MyHomePage> {
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: <Widget>[
                     // Left panel
-                    SizedBox(
-                      width: panelWidth,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 5),
-                        child: Center(
-                          child: (portrait || _rightHanded) ? data : controls,
-                        ),
-                      ),
+                    _buildSidePanel(
+                      isLeft: true,
+                      isExpanded: _isLeftPanelExpanded,
+                      onToggle: _toggleLeftPanel,
+                      content: (portrait || _rightHanded) ? data : controls,
+                      panelWidth: (portrait || _rightHanded) ? dataPanelWidth : controlPanelWidth,
                     ),
+
                     // Center image
                     SizedBox(
                       width: actualImageSize,
                       height: actualImageSize,
                       child: _imageStack(context),
                     ),
+
                     // Right panel
-                    SizedBox(
-                      width: panelWidth,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 5),
-                        child: Center(
-                          child: (portrait || _rightHanded) ? controls : data,
-                        ),
-                      ),
+                    _buildSidePanel(
+                      isLeft: false,
+                      isExpanded: _isRightPanelExpanded,
+                      onToggle: _toggleRightPanel,
+                      content: (portrait || _rightHanded) ? controls : data,
+                      panelWidth: (portrait || _rightHanded) ? controlPanelWidth : dataPanelWidth,
                     ),
                   ],
                 ),
