@@ -11,11 +11,45 @@ import 'platform_none.dart'
     if (dart.library.io) 'platform_mobile.dart'
     if (dart.library.html) 'platform_web.dart';
 
-class CedarDevice {
-  final String address; // IP or MAC address
-  final String? name; // null for WiFi
+enum CedarTransport { wifi, bluetooth }
 
-  CedarDevice({required this.address, this.name});
+/// A device the app can connect to, over WiFi or Bluetooth.
+///
+/// [name] is the device's single universal name: it is simultaneously the
+/// WiFi access-point SSID, the Bluetooth advertised name, and the mDNS name
+/// (reached at `<name>.local`). Over WiFi the host is derived from the name
+/// (`<name>.local`) rather than stored, so [name] may be null before we have
+/// ever learned it (first-ever contact); the resolution ladder then falls
+/// back to the AP address / subnet sweep. Over Bluetooth [btMac] holds the
+/// MAC needed to open the link, since it cannot be derived from the name.
+class CedarDevice {
+  final CedarTransport transport;
+  final String? name;
+  final String? btMac; // Set iff transport == bluetooth.
+
+  CedarDevice.wifi({this.name})
+      : transport = CedarTransport.wifi,
+        btMac = null;
+
+  CedarDevice.bluetooth({required this.name, required String this.btMac})
+      : transport = CedarTransport.bluetooth;
+
+  bool get isWifi => transport == CedarTransport.wifi;
+  bool get isBluetooth => transport == CedarTransport.bluetooth;
+
+  /// Stable identity key for equality/tracking (was the old `address`).
+  /// For BT that is the MAC; for WiFi the name (or empty when unknown).
+  String get key => btMac ?? name ?? '';
+
+  @override
+  bool operator ==(Object other) =>
+      other is CedarDevice &&
+      other.transport == transport &&
+      other.name == name &&
+      other.btMac == btMac;
+
+  @override
+  int get hashCode => Object.hash(transport, name, btMac);
 }
 
 /// Thrown by getClient() when a Bluetooth reconnect is in progress (either an
@@ -253,13 +287,28 @@ Future<void> setActiveDevice(CedarDevice device) async {
   await setActiveDeviceImpl(device);
 }
 
-/// Resolves 'cedar.local', caching the result. Falls back to 192.168.4.1
-/// if mDNS fails. Subsequent calls return the cached result immediately.
+/// Resolves the address to reach the device over WiFi, caching the result.
+/// Walks the resolution ladder: `<device_name>.local` via mDNS, then the AP
+/// address 192.168.4.1, then a parallel subnet sweep. Subsequent calls return
+/// the cached result immediately.
 Future<String> resolveCedarHost() async {
   return resolveCedarHostImpl();
 }
 
-/// The CedarDevice representing the WiFi transport (name is null, marking it
-/// as WiFi rather than Bluetooth). Used to let the user manually switch back
-/// to WiFi, e.g. from the connection recovery dialog.
-CedarDevice wifiDevice() => CedarDevice(address: wifiDeviceAddressImpl());
+/// The CedarDevice representing the WiFi transport. Used to switch to WiFi,
+/// e.g. from the connection recovery dialog. Carries the last-known device
+/// name if we have one (so it resolves `<name>.local`); otherwise the
+/// resolution ladder handles first-contact via the AP address / subnet sweep.
+CedarDevice wifiDevice() => CedarDevice.wifi(name: wifiDeviceNameImpl());
+
+/// Persists the device's WiFi mode (and client SSID for client mode) so the
+/// connection-recovery dialog's "use wifi" can resume the right mode. The
+/// passphrase is never stored — the server remembers it.
+Future<void> persistServerWifiMode(
+        {required bool isClient, String? clientSsid}) =>
+    persistServerWifiModeImpl(isClient: isClient, clientSsid: clientSsid);
+
+/// Reads the persisted device WiFi mode for recovery resume. Defaults to
+/// access-point (isClient == false) when nothing has been stored.
+Future<({bool isClient, String? clientSsid})> readServerWifiMode() =>
+    readServerWifiModeImpl();

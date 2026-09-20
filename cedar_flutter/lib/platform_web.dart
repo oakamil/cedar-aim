@@ -150,4 +150,11 @@ Future<String> resolveCedarHostImpl() async {
   return 'cedar.local'; // Web doesn't need mDNS fallback.
 }
 
-String wifiDeviceAddressImpl() => 'cedar.local';
+String? wifiDeviceNameImpl() => null; // Web reaches the server via its origin.
+
+Future<void> persistServerWifiModeImpl(
+    {required bool isClient, String? clientSsid}) async {}
+
+Future<({bool isClient, String? clientSsid})> readServerWifiModeImpl() async {
+  return (isClient: false, clientSsid: null);
+}

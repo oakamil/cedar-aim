@@ -154,7 +154,7 @@ Widget _buildDeviceSection(
       color: primaryColor,
     ),
     items: currentDevices.map((device) {
-      final label = device.name ?? device.address;
+      final label = device.name ?? device.key;
       return DropdownMenuItem<CedarDevice>(
         value: device,
         child: Text(

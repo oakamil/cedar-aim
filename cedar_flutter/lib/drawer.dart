@@ -1150,7 +1150,7 @@ Future<void> _connectionTransportDialog(
       return;
     }
     await setActiveDevice(
-        CedarDevice(address: status.address, name: status.name));
+        CedarDevice.bluetooth(name: status.name, btMac: status.address));
     dialogOverlayEntry?.remove();
   }
 

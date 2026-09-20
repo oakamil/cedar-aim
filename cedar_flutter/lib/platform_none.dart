@@ -101,6 +101,15 @@ Future<String> resolveCedarHostImpl() async {
   throw UnimplementedError("No impl in platform_none");
 }
 
-String wifiDeviceAddressImpl() {
+String? wifiDeviceNameImpl() {
+  throw UnimplementedError("No impl in platform_none");
+}
+
+Future<void> persistServerWifiModeImpl(
+    {required bool isClient, String? clientSsid}) async {
+  throw UnimplementedError("No impl in platform_none");
+}
+
+Future<({bool isClient, String? clientSsid})> readServerWifiModeImpl() async {
   throw UnimplementedError("No impl in platform_none");
 }

@@ -42,15 +42,32 @@ const _networkChannel = MethodChannel('cedar/network');
 // UUID for Cedar control channel defined in cedar-server
 String _btUuid = "4e5d4c88-2965-423f-9111-28a506720760";
 
-String _wifiAddress = "cedar.local";
+// The AP address, used as the second tier of the WiFi resolution ladder: it
+// is the device's out-of-box / access-point address, and also where the
+// device lands when it self-heals back to AP after a failed client join.
+const String _apAddress = "192.168.4.1";
+
+// SharedPreferences keys. Transport axis (how we reach the device):
+const String _prefDeviceName = 'device_name';
+const String _prefDeviceTransport = 'device_transport'; // 'wifi' | 'bluetooth'
+const String _prefDeviceBtMac = 'device_bt_mac';
+// Device WiFi-mode axis (what mode to resume from the recovery dialog):
+const String _prefServerWifiMode = 'server_wifi_mode'; // 'access_point'|'client'
+const String _prefServerWifiClientSsid = 'server_wifi_client_ssid';
+// Legacy keys (pre-schema-redesign), read once for migration.
+const String _legacyDeviceName = 'selected_device_name';
+const String _legacyDeviceAddress = 'selected_device_address';
+
+// The last-known device name (== AP SSID == BT name == mDNS <name>.local).
+// Learned from ServerInformation.device_name; null until first contact.
+String? _deviceName;
 
 // The device the app is currently using (or would use) to reach the server.
-// A WiFi device has a null name and an IP/hostname address; a Bluetooth
-// device has a non-null name and a MAC address. Defaults to WiFi; updated by
-// setActiveDeviceImpl() when the user selects a device.
-CedarDevice _activeDevice = CedarDevice(address: _wifiAddress);
+// Defaults to WiFi with no known name yet; updated by setActiveDeviceImpl()
+// when the user selects a device, and by learnDeviceNameImpl() on connect.
+CedarDevice _activeDevice = CedarDevice.wifi();
 
-String wifiDeviceAddressImpl() => _wifiAddress;
+String? wifiDeviceNameImpl() => _deviceName;
 ClientChannel? _channel;
 cedar_rpc.CedarClient? _client;
 BluetoothGrpcProxy? _activeProxy;
@@ -98,29 +115,214 @@ const _options = ChannelOptions(
 
 bool _boundToWifi = false;
 
-// Cached result of the cedar.local DNS lookup.
+// Cached result of the WiFi host resolution ladder. Cleared on teardown
+// (rpcFailedImpl/cleanup) so a network switch re-resolves.
 String? _resolvedCedarHost;
 
-/// Resolves 'cedar.local', caching the result. Falls back to 192.168.4.1
-/// if mDNS fails. Subsequent calls return the cached result immediately.
+/// Resolves the address to reach the device over WiFi, caching the result.
+/// Walks the resolution ladder (phone is assumed to be on the same subnet as
+/// the device):
+///   1. `<device_name>.local` via mDNS  — primary, zero-config;
+///   2. the AP address 192.168.4.1      — out-of-box / self-heal-to-AP;
+///   3. a parallel subnet sweep         — last resort, survives flaky mDNS.
+/// The sweep matches the known [_deviceName] when we have one (reconnection),
+/// or any device that speaks the Cedar protocol when we don't (first-ever
+/// contact / bootstrap).
 Future<String> resolveCedarHostImpl() async {
   if (_resolvedCedarHost != null) {
     return _resolvedCedarHost!;
   }
+
+  // Ensure the persisted device name is loaded before Tier 1 consults it —
+  // resolution can be driven before the first getClient() (e.g. updater_fix).
+  await _ensureDeviceLoaded();
+
+  // Tier 1: native mDNS service discovery. Browse `_cedar._tcp` and match the
+  // device_name TXT record against our target (or accept any responder when we
+  // have no name yet, i.e. bootstrap). This uses NsdManager/NWBrowser via the
+  // platform channel, since Dart's InternetAddress.lookup does not do mDNS on
+  // Android. Any failure (incl. MissingPluginException when the host app hasn't
+  // registered the channel) falls through to the tiers below.
   try {
-    final result = await InternetAddress.lookup('cedar.local')
-        .timeout(const Duration(seconds: 10));
-    if (result.isEmpty) {
-      throw SocketException('Could not resolve cedar.local');
+    final resolved = await _networkChannel.invokeMethod<String>('resolveMdns', {
+      'deviceName': _deviceName,
+    }).timeout(const Duration(seconds: 6));
+    if (resolved != null && resolved.isNotEmpty) {
+      debugPrint('mDNS service discovery resolved '
+          '"${_deviceName ?? '<any>'}" to $resolved');
+      _resolvedCedarHost = resolved;
+      return _resolvedCedarHost!;
     }
-    debugPrint('DNS lookup for cedar.local succeeded: ${result.first.address}');
-    _resolvedCedarHost = 'cedar.local';
+    debugPrint('mDNS service discovery found no matching _cedar._tcp instance');
   } catch (e) {
-    debugPrint('DNS lookup for cedar.local failed: $e');
-    _resolvedCedarHost = '192.168.4.1';
-    debugPrint('Using fallback IP address: $_resolvedCedarHost');
+    debugPrint('mDNS service discovery failed: $e');
   }
-  return _resolvedCedarHost!;
+
+  // Tier 2: the AP address. Cheap single probe.
+  if (await _probeCedarHost(_apAddress, matchName: _deviceName)) {
+    debugPrint('Resolved device at AP address $_apAddress');
+    _resolvedCedarHost = _apAddress;
+    return _resolvedCedarHost!;
+  }
+
+  // Tier 3: parallel subnet sweep.
+  final swept = await _sweepSubnetForCedar(matchName: _deviceName);
+  if (swept != null) {
+    debugPrint('Resolved device via subnet sweep at $swept');
+    _resolvedCedarHost = swept;
+    return _resolvedCedarHost!;
+  }
+
+  // Nothing found. Return the AP address as a last-ditch value so the caller's
+  // connection attempt fails cleanly (and re-drives the recovery flow) rather
+  // than us throwing here.
+  debugPrint('WiFi resolution ladder exhausted; defaulting to $_apAddress');
+  return _apAddress;
+}
+
+/// Opens a short-lived gRPC channel to [host] and asks for server info, via a
+/// non-blocking getFrame — that is the RPC that carries ServerInformation and
+/// is available in every server version (mirrors getServerInformation() in
+/// client_main.dart, but on its own throwaway channel so it can target a
+/// *candidate* host without disturbing the shared _client/_channel). Returns
+/// true if the host speaks the Cedar protocol and, when [matchName] is
+/// non-null, reports that device_name. Used by the AP probe and subnet sweep.
+Future<bool> _probeCedarHost(String host, {String? matchName}) async {
+  ClientChannel? channel;
+  try {
+    channel = ClientChannel(host,
+        port: 80,
+        options: const ChannelOptions(
+          credentials: ChannelCredentials.insecure(),
+        ));
+    final client = cedar_rpc.CedarClient(channel);
+    final request = cedar_rpc.FrameRequest()..nonBlocking = true;
+    final response = await client
+        .getFrame(request,
+            options: CallOptions(timeout: const Duration(seconds: 2)))
+        .timeout(const Duration(seconds: 3));
+    if (matchName == null || matchName.isEmpty) {
+      return true; // Bootstrap: any Cedar responder will do.
+    }
+    return response.serverInformation.deviceName == matchName;
+  } catch (_) {
+    return false;
+  } finally {
+    await channel?.shutdown().catchError((_) {});
+  }
+}
+
+/// Sweeps the phone's local /24 subnet(s), probing each host in parallel for a
+/// Cedar device. Returns the first matching host address, or null if none
+/// respond. Probes are batched to avoid opening hundreds of sockets at once.
+///
+/// Returns as soon as any probe in the current batch reports a match, without
+/// waiting for the batch's remaining probes (which would otherwise each run
+/// out their full timeout against dead IPs). Those losing probes are not
+/// actively cancelled — a gRPC ClientChannel has no cheap mid-flight cancel —
+/// but each shuts its channel down in its own `finally`, so they clean up as
+/// they time out in the background.
+Future<String?> _sweepSubnetForCedar({String? matchName}) async {
+  final prefixes = await _localSubnetV24Prefixes();
+  if (prefixes.isEmpty) {
+    return null;
+  }
+  const batchSize = 48;
+  for (final prefix in prefixes) {
+    for (var start = 1; start <= 254; start += batchSize) {
+      final end = (start + batchSize - 1).clamp(1, 254);
+      // Complete on the first matching probe; also complete with null once the
+      // whole batch has finished with no match, so we advance to the next batch.
+      final firstMatch = Completer<String?>();
+      final batch = <Future<void>>[];
+      for (var host = start; host <= end; host++) {
+        final addr = '$prefix.$host';
+        batch.add(_probeCedarHost(addr, matchName: matchName).then((ok) {
+          if (ok && !firstMatch.isCompleted) {
+            firstMatch.complete(addr);
+          }
+        }));
+      }
+      Future.wait(batch).then((_) {
+        if (!firstMatch.isCompleted) {
+          firstMatch.complete(null);
+        }
+      });
+      final match = await firstMatch.future;
+      if (match != null) {
+        return match;
+      }
+    }
+  }
+  return null;
+}
+
+// Interface-name fragments that identify a WiFi (or WiFi-hotspot) interface,
+// used to restrict the sweep to the network the device is actually reachable
+// on. "wlan"/"en0"/"en1" are the common WiFi names on Android/iOS; "ap"/"swlan"
+// /"tether" cover the phone's own-hotspot interface (the client-mode join
+// case). Interface names are platform- and vendor-dependent, hence the
+// private-range fallback below.
+const List<String> _wifiInterfaceHints = [
+  'wlan', 'en0', 'en1', 'ap', 'swlan', 'tether',
+];
+
+bool _isPrivateV24Prefix(String prefix) {
+  if (prefix.startsWith('192.168.')) {
+    return true;
+  }
+  if (prefix.startsWith('10.')) {
+    return true;
+  }
+  // 172.16.0.0 – 172.31.255.255
+  final parts = prefix.split('.');
+  if (parts.length >= 2 && parts[0] == '172') {
+    final second = int.tryParse(parts[1]);
+    if (second != null && second >= 16 && second <= 31) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Returns the /24 prefixes (e.g. "192.168.1") to sweep for the device.
+/// Restricts to WiFi interface(s) by name, since — per the same-subnet
+/// assumption — the device is only reachable over WiFi; sweeping a cellular or
+/// VPN subnet is useless and, for a VPN, antisocial. Falls back to all
+/// private-range prefixes if no interface matches the name hints (interface
+/// names are vendor-dependent). Excludes public ranges either way.
+Future<List<String>> _localSubnetV24Prefixes() async {
+  final wifiPrefixes = <String>{};
+  final privatePrefixes = <String>{};
+  try {
+    final interfaces = await NetworkInterface.list(
+        includeLoopback: false, type: InternetAddressType.IPv4);
+    for (final iface in interfaces) {
+      final name = iface.name.toLowerCase();
+      final isWifi = _wifiInterfaceHints.any((h) => name.contains(h));
+      for (final addr in iface.addresses) {
+        final parts = addr.address.split('.');
+        if (parts.length != 4) {
+          continue;
+        }
+        final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
+        if (isWifi) {
+          wifiPrefixes.add(prefix);
+        }
+        if (_isPrivateV24Prefix(prefix)) {
+          privatePrefixes.add(prefix);
+        }
+      }
+    }
+  } catch (e) {
+    debugPrint('Could not enumerate local subnets for sweep: $e');
+  }
+  if (wifiPrefixes.isNotEmpty) {
+    return wifiPrefixes.toList();
+  }
+  debugPrint('No WiFi interface matched by name; sweeping private ranges '
+      '$privatePrefixes');
+  return privatePrefixes.toList();
 }
 
 int btReconnectFailuresImpl() => _btReconnectFailures;
@@ -159,7 +361,7 @@ void rpcSucceededImpl() {
     _btReconnectFailures = 0;
   }
   _btTargetUnbonded = false;
-  if (Platform.isAndroid && !_boundToWifi && _activeDevice.name == null) {
+  if (Platform.isAndroid && !_boundToWifi && _activeDevice.isWifi) {
     _networkChannel.invokeMethod<bool>('bindToWifi').then((bound) {
       if (bound == true) {
         _boundToWifi = true;
@@ -238,13 +440,114 @@ Future<void> _shutdownChannel({int timeoutSeconds = 2}) async {
 // Track if we've loaded the selected device from SharedPreferences.
 bool _deviceLoaded = false;
 
+// One-time migration from the legacy prefs schema (selected_device_name /
+// selected_device_address) to the current one. The legacy schema encoded
+// transport implicitly (name present => Bluetooth) and overloaded the address
+// (MAC for BT, host for WiFi). Runs only if no current-schema key exists.
+Future<void> _migrateLegacyPrefs(SharedPreferences prefs) async {
+  if (prefs.getString(_prefDeviceTransport) != null) {
+    return; // Already on the current schema.
+  }
+  final legacyName = prefs.getString(_legacyDeviceName);
+  final legacyAddress = prefs.getString(_legacyDeviceAddress);
+  if (legacyAddress == null && legacyName == null) {
+    return; // Nothing persisted yet; first run.
+  }
+  if (legacyName != null) {
+    // Had a BT device: name is the device name, address is the MAC.
+    await prefs.setString(_prefDeviceTransport, 'bluetooth');
+    await prefs.setString(_prefDeviceName, legacyName);
+    if (legacyAddress != null) {
+      await prefs.setString(_prefDeviceBtMac, legacyAddress);
+    }
+  } else {
+    // Had a WiFi device: address was a host, either "<name>.local" or the
+    // bare AP IP. Recover the device name by stripping ".local"; if it was
+    // the AP IP (or otherwise not a .local name), leave the name unset so we
+    // re-learn it from ServerInformation on first contact.
+    await prefs.setString(_prefDeviceTransport, 'wifi');
+    if (legacyAddress != null && legacyAddress.endsWith('.local')) {
+      final name =
+          legacyAddress.substring(0, legacyAddress.length - '.local'.length);
+      if (name.isNotEmpty && name != 'cedar') {
+        // 'cedar' was the old hardcoded placeholder, never a real device
+        // name; treat it as unknown so we re-learn the real name.
+        await prefs.setString(_prefDeviceName, name);
+      }
+    }
+  }
+  await prefs.remove(_legacyDeviceName);
+  await prefs.remove(_legacyDeviceAddress);
+}
+
+// Loads persisted device selection (migrating the legacy schema first) into
+// the in-memory state: _activeDevice, _deviceName, _btDeviceSelected.
+Future<void> _loadDeviceSelection(SharedPreferences prefs) async {
+  await _migrateLegacyPrefs(prefs);
+  final transport = prefs.getString(_prefDeviceTransport);
+  final name = prefs.getString(_prefDeviceName);
+  _deviceName = name;
+  if (transport == 'bluetooth') {
+    final mac = prefs.getString(_prefDeviceBtMac);
+    if (mac != null) {
+      _activeDevice = CedarDevice.bluetooth(name: name, btMac: mac);
+      _btDeviceSelected = true;
+      return;
+    }
+  }
+  // Default / WiFi.
+  _activeDevice = CedarDevice.wifi(name: name);
+  _btDeviceSelected = false;
+}
+
+// Idempotently loads the persisted device selection (including _deviceName)
+// exactly once. Must be called before anything reads _deviceName/_activeDevice,
+// since resolution and connection can be driven in either order (e.g. Hopper
+// resolves the host early for updater_fix, before the first getClient()).
+Future<void> _ensureDeviceLoaded() async {
+  if (_deviceLoaded) {
+    return;
+  }
+  _deviceLoaded = true;
+  final prefs = await SharedPreferences.getInstance();
+  await _loadDeviceSelection(prefs);
+}
+
 // Call early (e.g. from initState) to set _btDeviceSelected before the first
 // build() runs, so the connection dialog gate works correctly from the start.
 Future<void> preloadDeviceSelectionImpl() async {
-  if (_deviceLoaded) return;
+  await _ensureDeviceLoaded();
+}
+
+// Persists the learned device name (fire-and-forget from the connect path).
+Future<void> _persistDeviceName(String name) async {
   final prefs = await SharedPreferences.getInstance();
-  final deviceName = prefs.getString('selected_device_name');
-  _btDeviceSelected = deviceName != null;
+  await prefs.setString(_prefDeviceName, name);
+}
+
+// Persists the device's WiFi mode (and client ssid for client mode) so the
+// connection-recovery dialog's "use wifi" can resume the right mode. Called
+// from setWifiModeImpl(); psk is never stored (the server remembers it).
+Future<void> persistServerWifiModeImpl(
+    {required bool isClient, String? clientSsid}) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(
+      _prefServerWifiMode, isClient ? 'client' : 'access_point');
+  if (isClient && clientSsid != null && clientSsid.isNotEmpty) {
+    await prefs.setString(_prefServerWifiClientSsid, clientSsid);
+  }
+}
+
+// Reads the persisted device WiFi mode for recovery resume. Returns a record
+// of (isClient, clientSsid). Defaults to access-point when nothing is stored.
+Future<({bool isClient, String? clientSsid})> readServerWifiModeImpl() async {
+  final prefs = await SharedPreferences.getInstance();
+  final mode = prefs.getString(_prefServerWifiMode);
+  final isClient = mode == 'client';
+  return (
+    isClient: isClient,
+    clientSsid: isClient ? prefs.getString(_prefServerWifiClientSsid) : null,
+  );
 }
 
 // Returns true if the target device is still bonded, or if the check itself
@@ -283,20 +586,24 @@ Future<void> _reconnectBluetooth() async {
   }
   _lastBtAttemptTime = DateTime.now();
 
-  if (!await _isTargetDeviceBonded(_activeDevice.address)) {
+  final mac = _activeDevice.btMac;
+  if (mac == null) {
+    return; // Not a Bluetooth device; nothing to reconnect.
+  }
+  if (!await _isTargetDeviceBonded(mac)) {
     // Unbonded is a permanent condition until the user re-pairs — waiting
     // out the cooldown won't help. Count it as a real failed attempt (keeps
     // the failure counter/log honest) but set the fast-path flag so the
     // dialog gate doesn't need to wait for the full failure threshold.
     _btReconnectFailures++;
     _btTargetUnbonded = true;
-    debugPrint('BT reconnect: ${_activeDevice.address} is no longer bonded '
+    debugPrint('BT reconnect: $mac is no longer bonded '
         '(consecutive failures: $_btReconnectFailures)');
     return;
   }
 
   try {
-    await _establishBluetoothConnection(_activeDevice.address);
+    await _establishBluetoothConnection(mac);
     if (_btReconnectFailures > 0) {
       debugPrint('BT reconnect succeeded after $_btReconnectFailures failure(s)');
     }
@@ -310,18 +617,13 @@ Future<void> _reconnectBluetooth() async {
 }
 
 Future<CedarClient> getClientImpl() async {
-  // On first call, load persisted device selection.
-  if (!_deviceLoaded) {
-    _deviceLoaded = true;
-    final prefs = await SharedPreferences.getInstance();
-    final deviceName = prefs.getString('selected_device_name');
-    final deviceAddress = prefs.getString('selected_device_address');
-    if (deviceAddress != null) {
-      debugPrint('Loaded device addr $deviceAddress name $deviceName');
-      _btDeviceSelected = deviceName != null;
-      final device = CedarDevice(address: deviceAddress, name: deviceName);
-      await setActiveDeviceImpl(device);
-    }
+  // Load persisted device selection (migrating legacy schema) if not already
+  // done — resolution may have loaded it first (e.g. updater_fix).
+  final wasLoaded = _deviceLoaded;
+  await _ensureDeviceLoaded();
+  if (!wasLoaded) {
+    debugPrint('Loaded device: transport=${_activeDevice.transport} '
+        'name=${_activeDevice.name} btMac=${_activeDevice.btMac}');
   }
 
   // For Android with a Bluetooth device, establish or check the connection.
@@ -336,7 +638,7 @@ Future<CedarClient> getClientImpl() async {
   // dead 127.0.0.1 port, and every RPC would fail with "Connection refused"
   // forever with nothing driving a reconnect. So a non-null `_client` is only
   // valid while the underlying BT link is actually connected.
-  if (isAndroidImpl() && _activeDevice.name != null) {
+  if (isAndroidImpl() && _activeDevice.isBluetooth) {
     final btAlive = _bluetoothConnection?.isConnected == true;
     if (btAlive && _client != null) {
       // Live link and a valid client — reuse it.
@@ -381,12 +683,12 @@ Future<CedarClient> getClientImpl() async {
   }
 
   // Try WiFi if we don't have a client (no BT device selected, or BT fell back).
-  if (_client == null && (!isAndroidImpl() || _activeDevice.name == null)) {
+  if (_client == null && (!isAndroidImpl() || _activeDevice.isWifi)) {
     await _shutdownChannel();
     _activeProxy = null;
     _activeProxyPort = null;
 
-    // Resolve cedar.local, using cached result if available.
+    // Resolve the WiFi host via the resolution ladder (cached if available).
     final addressToTry = await resolveCedarHostImpl();
 
     _channel = ClientChannel(addressToTry, port: 80, options: _options);
@@ -397,7 +699,7 @@ Future<CedarClient> getClientImpl() async {
     try {
       final request = cedar_rpc.FrameRequest()
         ..nonBlocking = true;
-      await _client!
+      final response = await _client!
           .getFrame(request,
               options: CallOptions(
                 timeout: const Duration(seconds: 5),
@@ -406,9 +708,19 @@ Future<CedarClient> getClientImpl() async {
         throw TimeoutException('WiFi connection test timed out connecting to $addressToTry:80');
       });
       debugPrint('WiFi connection test succeeded');
-      // Update active device to reflect WiFi usage.
+      // Update active device to reflect WiFi usage. Learn/refresh the device
+      // name from the response so future connects can resolve <name>.local.
+      final learnedName = response.serverInformation.deviceName;
+      if (learnedName.isNotEmpty && learnedName != _deviceName) {
+        debugPrint('Learned device name "$learnedName" '
+            '(was "${_deviceName ?? ''}"); persisting for <name>.local');
+        _deviceName = learnedName;
+        unawaited(_persistDeviceName(learnedName));
+      } else {
+        debugPrint('Device name unchanged: "${_deviceName ?? ''}"');
+      }
       if (isAndroidImpl()) {
-        _activeDevice = CedarDevice(address: addressToTry);
+        _activeDevice = CedarDevice.wifi(name: _deviceName);
       }
       return _client!;
     } catch (e) {
@@ -619,7 +931,7 @@ Future<List<CedarDevice>> getBluetoothDevicesImpl() async {
           displayName = d.address;
         }
 
-        return CedarDevice(address: d.address, name: displayName);
+        return CedarDevice.bluetooth(name: displayName, btMac: d.address);
       }).toList();
     } catch (e) {
       debugPrint('Error getting Bluetooth devices: $e');
@@ -637,10 +949,14 @@ Future<void> setActiveDeviceImpl(CedarDevice device) async {
     // churning) must preserve _btReconnectFailures/_lastBtAttemptTime so the
     // reconnect cooldown stays in effect — otherwise we defeat the cooldown and
     // re-page an already-struggling link.
-    final sameDevice = device.address == _activeDevice.address &&
-        device.name == _activeDevice.name;
+    final sameDevice = device == _activeDevice;
     _activeDevice = device;
-    _btDeviceSelected = device.name != null;
+    _btDeviceSelected = device.isBluetooth;
+    // Remember the device name across a WiFi/BT switch so WiFi can resolve
+    // <name>.local; a WiFi selection may carry no name yet (bootstrap).
+    if (device.name != null && device.name!.isNotEmpty) {
+      _deviceName = device.name;
+    }
     if (!sameDevice) {
       _btReconnectFailures = 0;
       _btTargetUnbonded = false;
@@ -649,16 +965,18 @@ Future<void> setActiveDeviceImpl(CedarDevice device) async {
     // Clean up any existing connection.
     await cleanupImpl();
 
-    // Persist device selection for next app launch.
+    // Persist device selection for next app launch (current schema).
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('selected_device_address', device.address);
-    if (device.name == null) {
-      // WiFi device - just remove the BT device name.
-      await prefs.remove('selected_device_name');
+    await prefs.setString(
+        _prefDeviceTransport, device.isBluetooth ? 'bluetooth' : 'wifi');
+    if (device.name != null && device.name!.isNotEmpty) {
+      await prefs.setString(_prefDeviceName, device.name!);
+    }
+    if (device.isBluetooth) {
+      // Connection will be established on the next getClientImpl() call.
+      await prefs.setString(_prefDeviceBtMac, device.btMac!);
     } else {
-      // Bluetooth device - persist the name. Connection will be established
-      // on the next getClientImpl() call.
-      await prefs.setString('selected_device_name', device.name!);
+      await prefs.remove(_prefDeviceBtMac);
     }
   } else {
     throw UnimplementedError("No implementation for iOS");
