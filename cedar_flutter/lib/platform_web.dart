@@ -146,11 +146,15 @@ Future<void> setActiveDeviceImpl(CedarDevice device) async {
   throw UnimplementedError("No impl in platform_web");
 }
 
-Future<String> resolveCedarHostImpl() async {
+Future<String?> resolveCedarHostImpl() async {
   return 'cedar.local'; // Web doesn't need mDNS fallback.
 }
 
 String? wifiDeviceNameImpl() => null; // Web reaches the server via its origin.
+
+Future<String> deviceModelImpl() async => ''; // Not meaningful on web.
+
+void resetWifiResolutionImpl() {} // Web has no resolution ladder to reset.
 
 Future<void> persistServerWifiModeImpl(
     {required bool isClient, String? clientSsid}) async {}

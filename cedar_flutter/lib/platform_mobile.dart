@@ -37,6 +37,30 @@ bool isIOSImpl() {
   return Platform.isIOS;
 }
 
+// Cached short model name of the phone/tablet running the app (e.g. "Pixel 8",
+// "iPhone", "iPad"), used to disambiguate "this device" from the Cedar device.
+// iOS redacts the user-set name since iOS 16, so this is the model/type, not a
+// personal name. Empty if unavailable.
+String _deviceModel = '';
+
+Future<String> deviceModelImpl() async {
+  if (_deviceModel.isNotEmpty) {
+    return _deviceModel;
+  }
+  try {
+    final info = DeviceInfoPlugin();
+    if (Platform.isAndroid) {
+      _deviceModel = (await info.androidInfo).model;
+    } else if (Platform.isIOS) {
+      // iOS gives a generic model ("iPhone"/"iPad") since the name is redacted.
+      _deviceModel = (await info.iosInfo).model;
+    }
+  } catch (e) {
+    debugPrint('deviceModel lookup failed: $e');
+  }
+  return _deviceModel;
+}
+
 const _networkChannel = MethodChannel('cedar/network');
 
 // UUID for Cedar control channel defined in cedar-server
@@ -68,6 +92,16 @@ String? _deviceName;
 CedarDevice _activeDevice = CedarDevice.wifi();
 
 String? wifiDeviceNameImpl() => _deviceName;
+
+// Forces the next WiFi connect to re-run the full resolution ladder instead of
+// reusing the cached address. Used when the user explicitly asks to reconnect
+// (e.g. the recovery dialog's "Retry") after possibly switching the device's
+// network — e.g. into client mode, where its address changes from the AP's
+// 192.168.4.1 to a DHCP address that only re-resolution (mDNS/sweep) can find.
+void resetWifiResolutionImpl() {
+  _resolvedCedarHost = null;
+  debugPrint('WiFi resolution reset; next connect will re-resolve');
+}
 ClientChannel? _channel;
 cedar_rpc.CedarClient? _client;
 BluetoothGrpcProxy? _activeProxy;
@@ -120,15 +154,17 @@ bool _boundToWifi = false;
 String? _resolvedCedarHost;
 
 /// Resolves the address to reach the device over WiFi, caching the result.
-/// Walks the resolution ladder (phone is assumed to be on the same subnet as
-/// the device):
+/// Returns null when nothing is reachable (e.g. the phone is on a network the
+/// device isn't on, or client isolation blocks it) — callers treat that as a
+/// failed connection rather than crashing. Walks the resolution ladder (phone
+/// is assumed to be on the same subnet as the device):
 ///   1. `<device_name>.local` via mDNS  — primary, zero-config;
 ///   2. the AP address 192.168.4.1      — out-of-box / self-heal-to-AP;
 ///   3. a parallel subnet sweep         — last resort, survives flaky mDNS.
 /// The sweep matches the known [_deviceName] when we have one (reconnection),
 /// or any device that speaks the Cedar protocol when we don't (first-ever
 /// contact / bootstrap).
-Future<String> resolveCedarHostImpl() async {
+Future<String?> resolveCedarHostImpl() async {
   if (_resolvedCedarHost != null) {
     return _resolvedCedarHost!;
   }
@@ -173,11 +209,10 @@ Future<String> resolveCedarHostImpl() async {
     return _resolvedCedarHost!;
   }
 
-  // Nothing found. Return the AP address as a last-ditch value so the caller's
-  // connection attempt fails cleanly (and re-drives the recovery flow) rather
-  // than us throwing here.
-  debugPrint('WiFi resolution ladder exhausted; defaulting to $_apAddress');
-  return _apAddress;
+  // Nothing found. Returning null ends the attempt quickly; the next probe
+  // re-resolves.
+  debugPrint('WiFi resolution ladder exhausted; no reachable address');
+  return null;
 }
 
 /// Opens a short-lived gRPC channel to [host] and asks for server info, via a
@@ -267,6 +302,13 @@ const List<String> _wifiInterfaceHints = [
   'wlan', 'en0', 'en1', 'ap', 'swlan', 'tether',
 ];
 
+// Interface-name fragments for virtual/container networks (Docker bridges,
+// veth pairs, VM bridges). These carry private IPs that would otherwise be
+// swept in the fallback below.
+const List<String> _virtualInterfaceHints = [
+  'docker', 'veth', 'br-', 'virbr', 'vmnet', 'vboxnet',
+];
+
 bool _isPrivateV24Prefix(String prefix) {
   if (prefix.startsWith('192.168.')) {
     return true;
@@ -299,6 +341,11 @@ Future<List<String>> _localSubnetV24Prefixes() async {
         includeLoopback: false, type: InternetAddressType.IPv4);
     for (final iface in interfaces) {
       final name = iface.name.toLowerCase();
+      // Skip virtual/container interfaces entirely — the device is never on a
+      // Docker bridge or VM network.
+      if (_virtualInterfaceHints.any((h) => name.contains(h))) {
+        continue;
+      }
       final isWifi = _wifiInterfaceHints.any((h) => name.contains(h));
       for (final addr in iface.addresses) {
         final parts = addr.address.split('.');
@@ -396,10 +443,14 @@ void rpcFailedImpl() {
   // a fresh one. Don't call cleanupImpl() here - it can race with device
   // selection which also calls cleanup.
   _client = null;
-  // Invalidate cached DNS so the next connection attempt re-resolves
-  // cedar.local — the device may have switched to a different WiFi network
-  // where Hopper is at a different IP.
-  _resolvedCedarHost = null;
+  // Deliberately KEEP _resolvedCedarHost: on a transient failure (e.g. the
+  // server briefly went away) the device is almost certainly still at the same
+  // address, so the next attempt should just retry it — that keeps reconnect
+  // (and the "connection lost" UI) fast instead of re-running the whole
+  // resolution ladder. The cache is invalidated only when a connection attempt
+  // to that cached address actually fails (see the WiFi connect path), which
+  // is the real "device moved / network switched" signal.
+  //
   // Unbind from the network so that on reconnect we rebind to the (possibly
   // new) network handle. Without this, returning to Hopper's WiFi after a
   // disconnect fails with "Machine is not on the network".
@@ -689,14 +740,21 @@ Future<CedarClient> getClientImpl() async {
     _activeProxyPort = null;
 
     // Resolve the WiFi host via the resolution ladder (cached if available).
-    final addressToTry = await resolveCedarHostImpl();
-
-    _channel = ClientChannel(addressToTry, port: 80, options: _options);
-    _client = CedarClient(_channel!);
-
-    // Test the WiFi connection before returning. Use getFrame() since it's
-    // been available in all server versions (unlike newer RPCs).
+    // This can throw when the ladder finds nothing reachable; treat that the
+    // same as a connection failure below.
+    String addressToTry = '?';
     try {
+      final resolved = await resolveCedarHostImpl();
+      if (resolved == null) {
+        throw Exception('No reachable Cedar address on this network');
+      }
+      addressToTry = resolved;
+
+      _channel = ClientChannel(addressToTry, port: 80, options: _options);
+      _client = CedarClient(_channel!);
+
+      // Test the WiFi connection before returning. Use getFrame() since it's
+      // been available in all server versions (unlike newer RPCs).
       final request = cedar_rpc.FrameRequest()
         ..nonBlocking = true;
       final response = await _client!
@@ -726,6 +784,13 @@ Future<CedarClient> getClientImpl() async {
     } catch (e) {
       _client = null;
       await _shutdownChannel(timeoutSeconds: 1);
+      // Keep _resolvedCedarHost: a failed attempt (typically "connection
+      // refused" while the server is briefly down, or a timeout) does NOT mean
+      // the address is wrong — the device is almost certainly still there. We
+      // keep retrying the same cached address on each reconnect probe so the
+      // "connection lost" UI surfaces quickly, instead of falling into the slow
+      // resolution ladder. The cache is re-resolved only on an explicit trigger
+      // (see resetWifiResolutionImpl, called on device (re)selection).
       // No Bluetooth fallback available, rethrow the error with context.
       debugPrint('WiFi connection test failed connecting to $addressToTry:80: $e');
       throw Exception('Failed to connect to Cedar ($addressToTry:80): $e');
@@ -893,6 +958,12 @@ Future<void> startAppUpdateImpl() async {
 
 Future<void> cleanupImpl() async {
   _client = null;
+  // Force the resolution ladder to run again next connect: cleanup happens on
+  // device (re)selection / transport switch / dispose, i.e. the moments where
+  // the device's address may genuinely have changed. (A plain RPC failure does
+  // NOT come through here, so a transient blip keeps retrying the cached
+  // address quickly rather than re-resolving.)
+  _resolvedCedarHost = null;
   await _shutdownChannel();
   await _activeProxy?.stop();
   await _bluetoothConnection?.close();

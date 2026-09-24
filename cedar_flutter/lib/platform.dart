@@ -4,6 +4,7 @@
 import 'package:cedar_flutter/cedar.pbgrpc.dart';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:open_settings_plus/open_settings_plus.dart';
 
 // Functions that have platform-specific implementations.
 
@@ -290,8 +291,10 @@ Future<void> setActiveDevice(CedarDevice device) async {
 /// Resolves the address to reach the device over WiFi, caching the result.
 /// Walks the resolution ladder: `<device_name>.local` via mDNS, then the AP
 /// address 192.168.4.1, then a parallel subnet sweep. Subsequent calls return
-/// the cached result immediately.
-Future<String> resolveCedarHost() async {
+/// the cached result immediately. Returns null when nothing is reachable
+/// (e.g. the phone is on a network the device isn't on); callers must handle
+/// null rather than assuming a usable address.
+Future<String?> resolveCedarHost() async {
   return resolveCedarHostImpl();
 }
 
@@ -312,3 +315,48 @@ Future<void> persistServerWifiMode(
 /// access-point (isClient == false) when nothing has been stored.
 Future<({bool isClient, String? clientSsid})> readServerWifiMode() =>
     readServerWifiModeImpl();
+
+/// The short model name of the phone/tablet running the app (e.g. "Pixel 8",
+/// "iPhone", "iPad"), for disambiguating "this device" from the Cedar device in
+/// UI text. Returns "" if unavailable; callers should have a generic fallback.
+Future<String> deviceModel() => deviceModelImpl();
+
+/// Discards the cached WiFi host so the next connect re-runs the resolution
+/// ladder. Call when the user explicitly asks to reconnect (e.g. "Retry")
+/// after the device may have moved to a new address (e.g. a client-mode join,
+/// where it leaves the AP's 192.168.4.1 for a DHCP address).
+void resetWifiResolution() => resetWifiResolutionImpl();
+
+/// Opens the phone's WiFi settings screen (so the user can join the network the
+/// device is switching to). Best-effort; failures are logged, not thrown.
+Future<void> openWifiSettings() async {
+  try {
+    await switch (OpenSettingsPlus.shared) {
+      OpenSettingsPlusAndroid settings => settings.wifi(),
+      OpenSettingsPlusIOS settings => settings.wifi(),
+      _ => throw Exception('Platform not supported'),
+    };
+  } catch (e) {
+    debugPrint('openWifiSettings error: $e');
+  }
+}
+
+/// Whether the phone offers a direct link to personal-hotspot / tethering
+/// settings. True on iOS (dedicated screen); false on Android, which has no
+/// reliable deep link — callers should not offer hotspot navigation there
+/// (dumping the user in WiFi settings instead would be misleading).
+bool get canOpenHotspotSettings => OpenSettingsPlus.shared is OpenSettingsPlusIOS;
+
+/// Opens the phone's personal-hotspot settings so the user can turn on the
+/// hotspot the device is about to join. Only meaningful when
+/// [canOpenHotspotSettings] is true. Best-effort; failures are logged.
+Future<void> openHotspotSettings() async {
+  try {
+    await switch (OpenSettingsPlus.shared) {
+      OpenSettingsPlusIOS settings => settings.personalHotspot(),
+      _ => throw Exception('Hotspot settings not available on this platform'),
+    };
+  } catch (e) {
+    debugPrint('openHotspotSettings error: $e');
+  }
+}

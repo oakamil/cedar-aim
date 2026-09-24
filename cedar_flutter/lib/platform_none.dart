@@ -97,11 +97,19 @@ Future<void> setActiveDeviceImpl(CedarDevice device) async {
 
 Future<void> preloadDeviceSelectionImpl() async {}
 
-Future<String> resolveCedarHostImpl() async {
+Future<String?> resolveCedarHostImpl() async {
   throw UnimplementedError("No impl in platform_none");
 }
 
 String? wifiDeviceNameImpl() {
+  throw UnimplementedError("No impl in platform_none");
+}
+
+Future<String> deviceModelImpl() async {
+  throw UnimplementedError("No impl in platform_none");
+}
+
+void resetWifiResolutionImpl() {
   throw UnimplementedError("No impl in platform_none");
 }
 

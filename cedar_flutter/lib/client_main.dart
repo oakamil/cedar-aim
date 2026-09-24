@@ -12,6 +12,7 @@ import 'package:cedar_flutter/controls_widget.dart';
 import 'package:cedar_flutter/draw_slew_target.dart';
 import 'package:cedar_flutter/draw_util.dart';
 import 'package:cedar_flutter/drawer.dart';
+import 'package:cedar_flutter/google/protobuf/duration.pb.dart' as pb_duration;
 import 'package:cedar_flutter/google/protobuf/timestamp.pb.dart';
 import 'package:cedar_flutter/guidance.dart';
 import 'package:cedar_flutter/interstitial_msg.dart';
@@ -106,6 +107,11 @@ UpdaterInfo? getUpdaterInfo() => _updaterInfo;
 // Use longer timeout for BT.
 const Duration _rpcTimeout = Duration(seconds: 5);
 const Duration _rpcTimeoutBt = Duration(seconds: 10);
+
+// A WiFi scan sweeps all channels on the radio, which takes several seconds
+// server-side.
+const Duration _scanWifiTimeout = Duration(seconds: 20);
+
 const Duration _getFrameRpcTimeout = Duration(seconds: 5);
 const Duration _getFrameRpcTimeoutBt = Duration(seconds: 10);
 
@@ -588,6 +594,12 @@ class MyHomePageState extends State<MyHomePage> {
 
   bool everConnected = false;
   bool _connectionDialogShowing = false;
+
+  // While the WiFi-mode transition guidance is up, suppress the
+  // connection-recovery dialog (the connection is expected to drop, and the
+  // guidance must own the screen).
+  bool wifiTransitionInProgress = false;
+
   DateTime _lastServerResponseTime = DateTime.now();
   String? _lastConnectionError;
 
@@ -1570,9 +1582,67 @@ class MyHomePageState extends State<MyHomePage> {
     return initiateAction(request);
   }
 
-  Future<void> setWifiEnabled(bool enabled) async {
-    final request = cedar_rpc.ActionRequest(wifiEnabled: enabled);
-    await initiateAction(request);
+  // Scans for nearby WiFi networks the device could join in client mode.
+  // Returns the networks (strongest signal first), or null on error.
+  Future<List<cedar_rpc.WifiNetwork>?> scanWifi() async {
+    try {
+      final c = await getClient();
+      final response = await c.scanWifi(cedar_rpc.EmptyMessage(),
+          options: CallOptions(timeout: _scanWifiTimeout));
+      return response.networks;
+    } catch (e) {
+      notifyRpcFailed('scanWifi error', e);
+      return null;
+    }
+  }
+
+  // Resumes whatever WiFi mode the device was last put in (access point or
+  // client), used when the user asks to (re)connect over WiFi. Defaults to
+  // access point when nothing is stored.
+  Future<String?> resumeLastWifiMode() async {
+    final last = await readServerWifiMode();
+    if (last.isClient && last.clientSsid != null) {
+      return setWifiMode(cedar_common.WifiMode.WIFI_MODE_CLIENT,
+          ssid: last.clientSsid);
+    }
+    return setWifiMode(cedar_common.WifiMode.WIFI_MODE_ACCESS_POINT);
+  }
+
+  // Switches the device's WiFi mode via the SetWifiMode RPC, and persists the
+  // chosen mode (and client SSID) so the connection-recovery dialog can later
+  // resume it. Returns null on success, or an error string. The RPC returns as
+  // soon as the switch is initiated.
+  Future<String?> setWifiMode(
+    cedar_common.WifiMode mode, {
+    String? ssid,
+    String? psk,
+    Duration? joinTimeout,
+  }) async {
+    final request = cedar_rpc.SetWifiModeRequest(mode: mode);
+    if (ssid != null) {
+      request.clientSsid = ssid;
+    }
+    if (psk != null && psk.isNotEmpty) {
+      request.clientPsk = psk;
+    }
+    if (joinTimeout != null) {
+      request.clientJoinTimeout = pb_duration.Duration(
+        seconds: Int64(joinTimeout.inSeconds),
+        nanos: (joinTimeout.inMicroseconds % 1000000) * 1000,
+      );
+    }
+    try {
+      final c = await getClient();
+      await c.setWifiMode(request,
+          options: CallOptions(timeout: _rpcTimeoutForTransport()));
+    } catch (e) {
+      notifyRpcFailed('setWifiMode error', e);
+      return e.toString();
+    }
+    // Persist only after the switch was accepted.
+    final isClient = mode == cedar_common.WifiMode.WIFI_MODE_CLIENT;
+    await persistServerWifiMode(isClient: isClient, clientSsid: ssid);
+    return null;
   }
 
   Future<void> _cancelCalibration() async {
@@ -2943,6 +3013,7 @@ class MyHomePageState extends State<MyHomePage> {
         crashServer: _crashServer,
         restartCedarServer: _restartCedarServer,
         initiateAction: initiateAction,
+        resumeLastWifiMode: resumeLastWifiMode,
         updatePreferences: updatePreferences,
         setAdvanced: (value) {
           setState(() {
@@ -3303,6 +3374,12 @@ class MyHomePageState extends State<MyHomePage> {
     if (_connectionDialogShowing) {
       return;
     }
+    // Suppress while a WiFi-mode transition's guidance owns the screen. This
+    // is re-driven on every rebuild while disconnected, so it reappears once
+    // the guidance is dismissed (if the connection is still down).
+    if (wifiTransitionInProgress) {
+      return;
+    }
     _connectionDialogShowing = true;
 
     try {
@@ -3343,7 +3420,8 @@ class MyHomePageState extends State<MyHomePage> {
           refreshDevices: isAndroid() ? () => getBluetoothDevices() : null,
           errorMessage: _lastConnectionError,
           onWifiRequested: () async {
-            await initiateAction(cedar_rpc.ActionRequest(wifiEnabled: true));
+            // "Use WiFi" resumes the device's last WiFi mode (AP or client).
+            await resumeLastWifiMode();
           },
           extraActionLabel: _updaterInfo != null && updateServiceAvailable
               ? 'Update $_productName'
