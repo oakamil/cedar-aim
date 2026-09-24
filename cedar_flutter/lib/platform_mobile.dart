@@ -195,34 +195,64 @@ Future<String?> resolveCedarHostImpl() async {
   }
 
   // Tier 2: the AP address. Cheap single probe.
-  if (await _probeCedarHost(_apAddress, matchName: _deviceName)) {
+  if (await _probeCedarHost(_apAddress, matchName: _deviceName) ==
+      _ProbeResult.matched) {
     debugPrint('Resolved device at AP address $_apAddress');
     _resolvedCedarHost = _apAddress;
     return _resolvedCedarHost!;
   }
 
   // Tier 3: parallel subnet sweep.
-  final swept = await _sweepSubnetForCedar(matchName: _deviceName);
-  if (swept != null) {
-    debugPrint('Resolved device via subnet sweep at $swept');
-    _resolvedCedarHost = swept;
+  final sweepResult = await _sweepSubnetForCedar(matchName: _deviceName);
+  if (sweepResult.match != null) {
+    debugPrint('Resolved device via subnet sweep at ${sweepResult.match}');
+    _resolvedCedarHost = sweepResult.match;
     return _resolvedCedarHost!;
   }
 
   // Nothing found. Returning null ends the attempt quickly; the next probe
-  // re-resolves.
-  debugPrint('WiFi resolution ladder exhausted; no reachable address');
+  // re-resolves. The sweep's reachable-host count tells us whether this
+  // network looks isolated (nothing responded at all) or just doesn't have
+  // Hopper on it (other hosts answered, so packets are getting through).
+  // Stashed for getClientImpl to fold into its connection-failure message.
+  _lastResolveDiagnostic = sweepResult.reachableCount > 0
+      ? null // Other hosts responded; isolation is ruled out, just no Hopper.
+      : 'No other devices on this network responded either. If this is a '
+          'guest or isolated WiFi network, CLIENT ISOLATION may be '
+          'preventing devices from finding each other.';
+  debugPrint('WiFi resolution ladder exhausted; no reachable address '
+      '(${sweepResult.reachableCount} other host(s) on the subnet responded)');
   return null;
+}
+
+// Set by resolveCedarHostImpl when the ladder exhausts with no reachable
+// address, as a hint for why (e.g. possible client isolation). Null when
+// resolution hasn't run, succeeded, or found other reachable hosts (which
+// rules out isolation). Read by getClientImpl to enrich its error message.
+String? _lastResolveDiagnostic;
+
+/// Outcome of probing a single host for the Cedar protocol.
+enum _ProbeResult {
+  /// Speaks Cedar and (if we asked) matches the target device_name.
+  matched,
+  /// Something answered — e.g. connection refused, or a non-Cedar/mismatched
+  /// response — proving the host is up and reachable, just not our target.
+  /// This is the signal that rules out client/AP isolation: packets got
+  /// through.
+  reachableNotMatch,
+  /// No response at all before our timeout: consistent with no host at that
+  /// address, or with isolation silently dropping the packets. Ambiguous on
+  /// its own.
+  noResponse,
 }
 
 /// Opens a short-lived gRPC channel to [host] and asks for server info, via a
 /// non-blocking getFrame — that is the RPC that carries ServerInformation and
 /// is available in every server version (mirrors getServerInformation() in
 /// client_main.dart, but on its own throwaway channel so it can target a
-/// *candidate* host without disturbing the shared _client/_channel). Returns
-/// true if the host speaks the Cedar protocol and, when [matchName] is
-/// non-null, reports that device_name. Used by the AP probe and subnet sweep.
-Future<bool> _probeCedarHost(String host, {String? matchName}) async {
+/// *candidate* host without disturbing the shared _client/_channel). Used by
+/// the AP probe and subnet sweep; see _ProbeResult for what the outcomes mean.
+Future<_ProbeResult> _probeCedarHost(String host, {String? matchName}) async {
   ClientChannel? channel;
   try {
     channel = ClientChannel(host,
@@ -237,19 +267,37 @@ Future<bool> _probeCedarHost(String host, {String? matchName}) async {
             options: CallOptions(timeout: const Duration(seconds: 2)))
         .timeout(const Duration(seconds: 3));
     if (matchName == null || matchName.isEmpty) {
-      return true; // Bootstrap: any Cedar responder will do.
+      return _ProbeResult.matched; // Bootstrap: any Cedar responder will do.
     }
-    return response.serverInformation.deviceName == matchName;
-  } catch (_) {
-    return false;
+    return response.serverInformation.deviceName == matchName
+        ? _ProbeResult.matched
+        : _ProbeResult.reachableNotMatch;
+  } on TimeoutException {
+    return _ProbeResult.noResponse;
+  } catch (e) {
+    // grpc-dart wraps every connection failure in GrpcError.unavailable
+    // ('Error connecting: $error'), regardless of the underlying cause — so
+    // `e is SocketException` never matches even for a genuine connection
+    // refused/reset, and everything fell through to noResponse. The original
+    // error's description survives inside GrpcError.message as text, so
+    // match on that instead. "Connection refused"/"Connection reset" mean a
+    // TCP stack answered — proof the host is there, even though it isn't a
+    // Cedar match. Silence-style causes (timed out, no route, unreachable)
+    // still mean no response.
+    final message = e.toString().toLowerCase();
+    final reachable = message.contains('connection refused') ||
+        message.contains('connection reset') ||
+        message.contains('econnrefused') ||
+        message.contains('econnreset');
+    return reachable ? _ProbeResult.reachableNotMatch : _ProbeResult.noResponse;
   } finally {
     await channel?.shutdown().catchError((_) {});
   }
 }
 
 /// Sweeps the phone's local /24 subnet(s), probing each host in parallel for a
-/// Cedar device. Returns the first matching host address, or null if none
-/// respond. Probes are batched to avoid opening hundreds of sockets at once.
+/// Cedar device. Probes are batched to avoid opening hundreds of sockets at
+/// once.
 ///
 /// Returns as soon as any probe in the current batch reports a match, without
 /// waiting for the batch's remaining probes (which would otherwise each run
@@ -257,12 +305,21 @@ Future<bool> _probeCedarHost(String host, {String? matchName}) async {
 /// actively cancelled — a gRPC ClientChannel has no cheap mid-flight cancel —
 /// but each shuts its channel down in its own `finally`, so they clean up as
 /// they time out in the background.
-Future<String?> _sweepSubnetForCedar({String? matchName}) async {
+///
+/// [reachableCount] in the result is how many *other* hosts answered
+/// (reachable but not a Cedar match) across the whole sweep when no match was
+/// found — evidence the subnet isn't isolated, it just doesn't have the
+/// target device on it. Only accumulated when we don't short-circuit on a
+/// match, since once we've found what we're looking for the rest of the
+/// sweep's outcome no longer matters.
+Future<({String? match, int reachableCount})> _sweepSubnetForCedar(
+    {String? matchName}) async {
   final prefixes = await _localSubnetV24Prefixes();
   if (prefixes.isEmpty) {
-    return null;
+    return (match: null, reachableCount: 0);
   }
   const batchSize = 48;
+  var reachableCount = 0;
   for (final prefix in prefixes) {
     for (var start = 1; start <= 254; start += batchSize) {
       final end = (start + batchSize - 1).clamp(1, 254);
@@ -272,9 +329,16 @@ Future<String?> _sweepSubnetForCedar({String? matchName}) async {
       final batch = <Future<void>>[];
       for (var host = start; host <= end; host++) {
         final addr = '$prefix.$host';
-        batch.add(_probeCedarHost(addr, matchName: matchName).then((ok) {
-          if (ok && !firstMatch.isCompleted) {
-            firstMatch.complete(addr);
+        batch.add(_probeCedarHost(addr, matchName: matchName).then((result) {
+          switch (result) {
+            case _ProbeResult.matched:
+              if (!firstMatch.isCompleted) {
+                firstMatch.complete(addr);
+              }
+            case _ProbeResult.reachableNotMatch:
+              reachableCount++;
+            case _ProbeResult.noResponse:
+              break;
           }
         }));
       }
@@ -285,11 +349,11 @@ Future<String?> _sweepSubnetForCedar({String? matchName}) async {
       });
       final match = await firstMatch.future;
       if (match != null) {
-        return match;
+        return (match: match, reachableCount: reachableCount);
       }
     }
   }
-  return null;
+  return (match: null, reachableCount: reachableCount);
 }
 
 // Interface-name fragments that identify a WiFi (or WiFi-hotspot) interface,
@@ -746,7 +810,9 @@ Future<CedarClient> getClientImpl() async {
     try {
       final resolved = await resolveCedarHostImpl();
       if (resolved == null) {
-        throw Exception('No reachable Cedar address on this network');
+        final hint = _lastResolveDiagnostic;
+        throw Exception('No reachable Cedar address on this network'
+            '${hint != null ? '. $hint' : ''}');
       }
       addressToTry = resolved;
 
