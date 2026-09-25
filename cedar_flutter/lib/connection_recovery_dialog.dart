@@ -309,7 +309,7 @@ Future<void> showConnectionRecoveryDialog({
               if (hasSettingsAccess)
                 TextButton.icon(
                   icon: const Icon(Icons.wifi_find),
-                  label: const Text('WiFi Settings'),
+                  label: Text(wifiSettingsLabel),
                   onPressed: () async {
                     await openWifiSettings();
                   },

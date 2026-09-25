@@ -329,17 +329,30 @@ void resetWifiResolution() => resetWifiResolutionImpl();
 
 /// Opens the phone's WiFi settings screen (so the user can join the network the
 /// device is switching to). Best-effort; failures are logged, not thrown.
+///
+/// On Android this reliably opens the WiFi settings pane directly. On iOS,
+/// Apple provides no public API to deep-link to the WiFi pane specifically;
+/// the private App-Prefs:WIFI URL scheme this used to rely on is rejected by
+/// modern iOS versions and falls back to this app's own settings page
+/// (app-settings:), not general Settings. We use settings() (App-prefs:)
+/// instead, which reliably opens the top-level Settings app; see
+/// [wifiSettingsLabel] for UI copy that matches this.
 Future<void> openWifiSettings() async {
   try {
     await switch (OpenSettingsPlus.shared) {
       OpenSettingsPlusAndroid settings => settings.wifi(),
-      OpenSettingsPlusIOS settings => settings.wifi(),
+      OpenSettingsPlusIOS settings => settings.settings(),
       _ => throw Exception('Platform not supported'),
     };
   } catch (e) {
     debugPrint('openWifiSettings error: $e');
   }
 }
+
+/// Label for the button/link that calls [openWifiSettings], reflecting what
+/// the platform actually navigates to: Android goes straight to the WiFi
+/// pane, iOS can only reach the general Settings app.
+String get wifiSettingsLabel => isIOS() ? 'Settings' : 'WiFi Settings';
 
 /// Whether the phone offers a direct link to personal-hotspot / tethering
 /// settings. True on iOS (dedicated screen); false on Android, which has no
